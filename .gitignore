@@ -1,3 +1,4 @@
 vpn-client-simple
 vpn-server-simple
 wg-simple
+.env
