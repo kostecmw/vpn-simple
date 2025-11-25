@@ -7,7 +7,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -16,7 +18,7 @@ import (
 // No encryption, no security, fixed 2 peers
 
 const (
-	MTU        = 1420
+	MTU        = 1400
 	PacketData = 1 // Packet type for data transfer
 )
 
@@ -25,6 +27,11 @@ type Config struct {
 	LocalAddr  string // Local UDP address
 	RemoteAddr string // Remote peer UDP address
 	TunName    string // TUN interface name
+	TunIP      string // IP address for TUN interface
+	TunMask    string // Subnet mask (e.g., "24" for /24)
+	EnableNAT  bool   // Enable NAT/masquerading
+	NATIface   string // Interface for NAT (e.g., eth0)
+	AddRoute   string // Add route via VPN (e.g., "default" or "8.8.8.8/32")
 }
 
 // Peer represents the other end of the VPN tunnel
@@ -56,6 +63,11 @@ type PacketHeader struct {
 func main() {
 	config := parseFlags()
 
+	// Check if running as root
+	if os.Geteuid() != 0 {
+		log.Fatal("This program must be run as root (use sudo)")
+	}
+
 	log.Printf("Starting simplified VPN in %s mode", config.Mode)
 	log.Printf("Local: %s, Remote: %s", config.LocalAddr, config.RemoteAddr)
 
@@ -66,8 +78,27 @@ func main() {
 	}
 	defer dev.Close()
 
+	// Configure TUN interface
+	if err := dev.ConfigureTUN(); err != nil {
+		log.Fatalf("Failed to configure TUN: %v", err)
+	}
+
+	// Setup routing
+	if err := dev.SetupRouting(); err != nil {
+		log.Fatalf("Failed to setup routing: %v", err)
+	}
+
+	// Setup NAT if enabled
+	if config.EnableNAT {
+		if err := dev.SetupNAT(); err != nil {
+			log.Fatalf("Failed to setup NAT: %v", err)
+		}
+	}
+
 	// Start packet processing
 	dev.Start()
+
+	log.Println("✓ VPN is ready!")
 
 	// Wait for interrupt
 	sigChan := make(chan os.Signal, 1)
@@ -75,6 +106,7 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down...")
+	dev.Cleanup()
 }
 
 func parseFlags() *Config {
@@ -84,6 +116,11 @@ func parseFlags() *Config {
 	flag.StringVar(&config.LocalAddr, "local", ":51820", "Local UDP address")
 	flag.StringVar(&config.RemoteAddr, "remote", "", "Remote peer UDP address")
 	flag.StringVar(&config.TunName, "tun", "tun0", "TUN interface name")
+	flag.StringVar(&config.TunIP, "tun-ip", "", "TUN interface IP (required)")
+	flag.StringVar(&config.TunMask, "tun-mask", "24", "TUN interface subnet mask (default: 24)")
+	flag.BoolVar(&config.EnableNAT, "enable-nat", false, "Enable NAT/masquerading (server mode)")
+	flag.StringVar(&config.NATIface, "nat-iface", "eth0", "Interface for NAT outbound traffic")
+	flag.StringVar(&config.AddRoute, "route", "", "Add route via VPN (e.g., 'default' or '8.8.8.8/32')")
 	flag.Parse()
 
 	if config.Mode != "client" && config.Mode != "server" {
@@ -91,7 +128,16 @@ func parseFlags() *Config {
 	}
 
 	if config.RemoteAddr == "" {
-		log.Fatal("Remote address is required")
+		log.Fatal("Remote address is required (-remote)")
+	}
+
+	if config.TunIP == "" {
+		log.Fatal("TUN IP address is required (-tun-ip)")
+	}
+
+	// Validate NAT settings
+	if config.EnableNAT && config.Mode != "server" {
+		log.Println("Warning: NAT is typically used in server mode")
 	}
 
 	return config
@@ -129,14 +175,171 @@ func NewDevice(config *Config) (*Device, error) {
 		conn: conn,
 	}
 
-	log.Printf("TUN device created: %s (MTU: %d)", config.TunName, MTU)
-	log.Printf("UDP socket listening on: %s", localAddr.String())
+	log.Printf("✓ TUN device created: %s (MTU: %d)", tun.name, MTU)
+	log.Printf("✓ UDP socket listening on: %s", localAddr.String())
 
 	return &Device{
 		tun:    tun,
 		peer:   peer,
 		config: config,
 	}, nil
+}
+
+// ConfigureTUN sets up the TUN interface with IP address
+func (d *Device) ConfigureTUN() error {
+	log.Printf("Configuring TUN interface %s...", d.tun.name)
+
+	// Set IP address
+	cidr := fmt.Sprintf("%s/%s", d.config.TunIP, d.config.TunMask)
+	if err := runCommand("ip", "addr", "add", cidr, "dev", d.tun.name); err != nil {
+		return fmt.Errorf("set IP address: %w", err)
+	}
+	log.Printf("✓ IP address: %s", cidr)
+
+	// Set MTU
+	if err := runCommand("ip", "link", "set", d.tun.name, "mtu", fmt.Sprintf("%d", MTU)); err != nil {
+		return fmt.Errorf("set MTU: %w", err)
+	}
+	log.Printf("✓ MTU: %d", MTU)
+
+	// Bring interface up
+	if err := runCommand("ip", "link", "set", d.tun.name, "up"); err != nil {
+		return fmt.Errorf("bring interface up: %w", err)
+	}
+	log.Printf("✓ Interface is UP")
+
+	return nil
+}
+
+// SetupRouting configures routing through the VPN
+func (d *Device) SetupRouting() error {
+	if d.config.AddRoute == "" {
+		return nil
+	}
+
+	log.Printf("Setting up routing...")
+
+	route := d.config.AddRoute
+
+	if route == "default" {
+		// Add default route through VPN
+		// Extract gateway IP from TUN IP (assuming peer is x.x.x.1 if we're x.x.x.2)
+		parts := strings.Split(d.config.TunIP, ".")
+		if len(parts) != 4 {
+			return fmt.Errorf("invalid TUN IP format")
+		}
+
+		// Simple logic: if we're .2, gateway is .1, and vice versa
+		lastOctet := parts[3]
+		gateway := strings.Join(parts[:3], ".")
+		if lastOctet == "1" {
+			gateway += ".2"
+		} else {
+			gateway += ".1"
+		}
+
+		// Add default route with higher metric (so it doesn't override existing)
+		if err := runCommand("ip", "route", "add", "default", "via", gateway, "dev", d.tun.name, "metric", "100"); err != nil {
+			return fmt.Errorf("add default route: %w", err)
+		}
+		log.Printf("✓ Default route via %s", gateway)
+
+	} else {
+		// Add specific route
+		parts := strings.Split(d.config.TunIP, ".")
+		gateway := strings.Join(parts[:3], ".")
+		lastOctet := parts[3]
+		if lastOctet == "1" {
+			gateway += ".2"
+		} else {
+			gateway += ".1"
+		}
+
+		if err := runCommand("ip", "route", "add", route, "via", gateway, "dev", d.tun.name); err != nil {
+			return fmt.Errorf("add route: %w", err)
+		}
+		log.Printf("✓ Route %s via %s", route, gateway)
+	}
+
+	return nil
+}
+
+// SetupNAT configures NAT/masquerading for internet access
+func (d *Device) SetupNAT() error {
+	log.Printf("Setting up NAT...")
+
+	// Enable IP forwarding
+	if err := runCommand("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
+		return fmt.Errorf("enable IP forwarding: %w", err)
+	}
+	log.Printf("✓ IP forwarding enabled")
+
+	// Calculate subnet from TUN IP and mask
+	subnet := calculateSubnet(d.config.TunIP, d.config.TunMask)
+
+	// Add MASQUERADE rule
+	if err := runCommand("iptables", "-t", "nat", "-A", "POSTROUTING",
+		"-s", subnet, "-o", d.config.NATIface, "-j", "MASQUERADE"); err != nil {
+		return fmt.Errorf("add MASQUERADE rule: %w", err)
+	}
+	log.Printf("✓ MASQUERADE rule added for %s", subnet)
+
+	// Allow forwarding from TUN to NAT interface
+	if err := runCommand("iptables", "-A", "FORWARD",
+		"-i", d.tun.name, "-o", d.config.NATIface, "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("add forward rule: %w", err)
+	}
+	log.Printf("✓ Forward rule added")
+
+	// Allow forwarding from NAT interface to TUN (established connections)
+	if err := runCommand("iptables", "-A", "FORWARD",
+		"-i", d.config.NATIface, "-o", d.tun.name,
+		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("add return forward rule: %w", err)
+	}
+	log.Printf("✓ Return forward rule added")
+
+	// Add MSS clamping for better compatibility
+	if err := runCommand("iptables", "-t", "mangle", "-A", "FORWARD",
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu"); err != nil {
+		log.Printf("Warning: Could not add MSS clamping: %v", err)
+	} else {
+		log.Printf("✓ MSS clamping added")
+	}
+
+	return nil
+}
+
+// Cleanup removes routes and iptables rules
+func (d *Device) Cleanup() {
+	log.Println("Cleaning up...")
+
+	// Remove routes
+	if d.config.AddRoute != "" {
+		if d.config.AddRoute == "default" {
+			runCommand("ip", "route", "del", "default", "dev", d.tun.name)
+		} else {
+			runCommand("ip", "route", "del", d.config.AddRoute, "dev", d.tun.name)
+		}
+	}
+
+	// Remove NAT rules if they were added
+	if d.config.EnableNAT {
+		subnet := calculateSubnet(d.config.TunIP, d.config.TunMask)
+		runCommand("iptables", "-t", "nat", "-D", "POSTROUTING",
+			"-s", subnet, "-o", d.config.NATIface, "-j", "MASQUERADE")
+		runCommand("iptables", "-D", "FORWARD",
+			"-i", d.tun.name, "-o", d.config.NATIface, "-j", "ACCEPT")
+		runCommand("iptables", "-D", "FORWARD",
+			"-i", d.config.NATIface, "-o", d.tun.name,
+			"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		runCommand("iptables", "-t", "mangle", "-D", "FORWARD",
+			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS", "--clamp-mss-to-pmtu")
+	}
+
+	log.Println("✓ Cleanup complete")
 }
 
 func (d *Device) Start() {
@@ -146,7 +349,7 @@ func (d *Device) Start() {
 	// Goroutine 2: UDP -> TUN (Inbound)
 	go d.routineUDPRead()
 
-	log.Println("Packet processing started")
+	log.Println("✓ Packet processing started")
 }
 
 // routineTUNRead reads packets from TUN and sends to UDP
@@ -177,7 +380,7 @@ func (d *Device) routineTUNRead() {
 			continue
 		}
 
-		log.Printf("OUT: TUN -> UDP (%d bytes)", n)
+		log.Printf("→ OUT: %d bytes", n)
 	}
 }
 
@@ -219,7 +422,7 @@ func (d *Device) routineUDPRead() {
 			continue
 		}
 
-		log.Printf("IN: UDP <- TUN (%d bytes from %s)", dataLen, addr.String())
+		log.Printf("← IN: %d bytes from %s", dataLen, addr.String())
 	}
 }
 
@@ -230,6 +433,32 @@ func (d *Device) Close() {
 	if d.tun != nil {
 		d.tun.Close()
 	}
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+func runCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s failed: %w\nOutput: %s", name, err, string(output))
+	}
+	return nil
+}
+
+func calculateSubnet(ip, mask string) string {
+	return fmt.Sprintf("%s/%s", getNetworkAddress(ip, mask), mask)
+}
+
+func getNetworkAddress(ip, mask string) string {
+	// Simple subnet calculation for /24 networks
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return ip
+	}
+	return fmt.Sprintf("%s.%s.%s.0", parts[0], parts[1], parts[2])
 }
 
 // =============================================================================
@@ -280,11 +509,6 @@ func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 		mtu:  mtu,
 	}
 
-	// Bring interface up (requires ip command or manual configuration)
-	log.Printf("TUN interface created: %s", actualName)
-	log.Printf("Configure it with: sudo ip addr add 10.0.0.X/24 dev %s", actualName)
-	log.Printf("                   sudo ip link set %s up", actualName)
-
 	return tun, nil
 }
 
@@ -307,23 +531,85 @@ func (t *TUNDevice) Close() error {
 // =============================================================================
 
 /*
-SETUP (run in separate terminals):
+SIMPLE SETUP (just ping between peers):
 
 Terminal 1 (Server):
-$ sudo go run simple-vpn.go -mode server -local :51820 -remote 127.0.0.1:51821 -tun tun0
-$ sudo ip addr add 10.0.0.1/24 dev tun0
-$ sudo ip link set tun0 up
+$ sudo go run simple-vpn.go \
+    -mode server \
+    -local :51820 \
+    -remote 127.0.0.1:51821 \
+    -tun-ip 10.0.0.1
 
 Terminal 2 (Client):
-$ sudo go run simple-vpn.go -mode client -local :51821 -remote 127.0.0.1:51820 -tun tun1
-$ sudo ip addr add 10.0.0.2/24 dev tun1
-$ sudo ip link set tun1 up
+$ sudo go run simple-vpn.go \
+    -mode client \
+    -local :51821 \
+    -remote 127.0.0.1:51820 \
+    -tun-ip 10.0.0.2
 
-TEST:
-Terminal 1: $ ping 10.0.0.2
-Terminal 2: $ ping 10.0.0.1
+Test: ping 10.0.0.1 (from client) or ping 10.0.0.2 (from server)
+
+---
+
+INTERNET ACCESS SETUP (client routes all traffic through server):
+
+Terminal 1 (Server with NAT):
+$ sudo go run simple-vpn.go \
+    -mode server \
+    -local :51820 \
+    -remote CLIENT_PUBLIC_IP:51821 \
+    -tun-ip 10.0.0.1 \
+    -enable-nat \
+    -nat-iface eth0
+
+Terminal 2 (Client with default route):
+$ sudo go run simple-vpn.go \
+    -mode client \
+    -local :51821 \
+    -remote SERVER_PUBLIC_IP:51820 \
+    -tun-ip 10.0.0.2 \
+    -route default
+
+Test: curl ifconfig.me (should show server's IP)
+
+---
+
+SPECIFIC ROUTES (only route certain IPs through VPN):
+
+Terminal 2 (Client):
+$ sudo go run simple-vpn.go \
+    -mode client \
+    -local :51821 \
+    -remote 127.0.0.1:51820 \
+    -tun-ip 10.0.0.2 \
+    -route 8.8.8.8/32
+
+Test: ping 8.8.8.8 (goes through VPN)
+      ping 1.1.1.1 (goes directly)
+
+---
+
+FLAGS:
+  -mode string
+        Mode: client or server (default "client")
+  -local string
+        Local UDP address (default ":51820")
+  -remote string
+        Remote peer UDP address (required)
+  -tun string
+        TUN interface name (default "tun0")
+  -tun-ip string
+        TUN interface IP address (required)
+  -tun-mask string
+        TUN subnet mask (default "24")
+  -enable-nat
+        Enable NAT/masquerading (typically server mode)
+  -nat-iface string
+        Network interface for NAT (default "eth0")
+  -route string
+        Add route via VPN: "default" or specific IP/CIDR
 
 CLEANUP:
-$ sudo ip link delete tun0
-$ sudo ip link delete tun1
+The program automatically cleans up on exit (Ctrl+C)
+Or manually: sudo ip link delete tun0
 */
