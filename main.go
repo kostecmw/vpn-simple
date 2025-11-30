@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -23,15 +25,17 @@ const (
 )
 
 type Config struct {
-	Mode       string // "client" or "server"
-	LocalAddr  string // Local UDP address
-	RemoteAddr string // Remote peer UDP address
-	TunName    string // TUN interface name
-	TunIP      string // IP address for TUN interface
-	TunMask    string // Subnet mask (e.g., "24" for /24)
-	EnableNAT  bool   // Enable NAT/masquerading
-	NATIface   string // Interface for NAT (e.g., eth0)
-	AddRoute   string // Add route via VPN (e.g., "default" or "8.8.8.8/32")
+	Mode          string // "client" or "server"
+	LocalAddr     string // Local UDP address
+	RemoteAddr    string // Remote peer UDP address
+	TunName       string // TUN interface name
+	TunIP         string // IP address for TUN interface
+	TunMask       string // Subnet mask (e.g., "24" for /24)
+	EnableNAT     bool   // Enable NAT/masquerading
+	NATIface      string // Interface for NAT (e.g., eth0)
+	AddRoute      string // Add route via VPN (e.g., "default" or "8.8.8.8/32")
+	EncryptionKey string // Hex-encoded 32-byte encryption key
+	GenerateKey   bool   // Flag to generate and print key then exit
 }
 
 // RouteBackup stores original routing information for restoration
@@ -49,10 +53,11 @@ type Peer struct {
 
 // Device represents our VPN device
 type Device struct {
-	tun         *TUNDevice
-	peer        *Peer
-	config      *Config
-	routeBackup *RouteBackup
+	tun           *TUNDevice
+	peer          *Peer
+	config        *Config
+	routeBackup   *RouteBackup
+	encryptionKey []byte // 32-byte encryption key
 }
 
 // TUNDevice represents a virtual network interface
@@ -70,6 +75,12 @@ type PacketHeader struct {
 
 func main() {
 	config := parseFlags()
+
+	// Handle key generation request
+	if config.GenerateKey {
+		generateAndPrintKey()
+		return
+	}
 
 	// Check if running as root
 	if os.Geteuid() != 0 {
@@ -129,7 +140,14 @@ func parseFlags() *Config {
 	flag.BoolVar(&config.EnableNAT, "enable-nat", false, "Enable NAT/masquerading (server mode)")
 	flag.StringVar(&config.NATIface, "nat-iface", "eth0", "Interface for NAT outbound traffic")
 	flag.StringVar(&config.AddRoute, "route", "", "Add route via VPN (e.g., 'default' or '8.8.8.8/32')")
+	flag.StringVar(&config.EncryptionKey, "key", "", "Encryption key (64 hex characters = 32 bytes)")
+	flag.BoolVar(&config.GenerateKey, "generate-key", false, "Generate a new encryption key and exit")
 	flag.Parse()
+
+	// If generating key, no other validation needed
+	if config.GenerateKey {
+		return config
+	}
 
 	if config.Mode != "client" && config.Mode != "server" {
 		log.Fatal("Mode must be 'client' or 'server'")
@@ -152,6 +170,20 @@ func parseFlags() *Config {
 }
 
 func NewDevice(config *Config) (*Device, error) {
+	// Parse and validate encryption key if provided
+	var encryptionKey []byte
+	if config.EncryptionKey != "" {
+		key, err := parseEncryptionKey(config.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid encryption key: %w", err)
+		}
+		encryptionKey = key
+		log.Printf("✓ Encryption key loaded (%d bytes)", len(encryptionKey))
+	} else {
+		log.Printf("⚠ Warning: No encryption key provided - traffic will be sent in PLAINTEXT!")
+		log.Printf("   Generate a key with: go run simple-vpn.go -generate-key")
+	}
+
 	// Create TUN device
 	tun, err := CreateTUN(config.TunName, MTU)
 	if err != nil {
@@ -187,10 +219,11 @@ func NewDevice(config *Config) (*Device, error) {
 	log.Printf("✓ UDP socket listening on: %s", localAddr.String())
 
 	return &Device{
-		tun:         tun,
-		peer:        peer,
-		config:      config,
-		routeBackup: &RouteBackup{},
+		tun:           tun,
+		peer:          peer,
+		config:        config,
+		routeBackup:   &RouteBackup{},
+		encryptionKey: encryptionKey,
 	}, nil
 }
 
@@ -577,6 +610,64 @@ func extractIPFromAddr(addr string) string {
 	}
 
 	return ips[0].String()
+}
+
+// =============================================================================
+// Encryption Key Management
+// =============================================================================
+
+// generateAndPrintKey generates a new random 32-byte encryption key
+func generateAndPrintKey() {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		log.Fatalf("Failed to generate random key: %v", err)
+	}
+
+	hexKey := hex.EncodeToString(key)
+
+	fmt.Println("==============================================")
+	fmt.Println("        Generated Encryption Key")
+	fmt.Println("==============================================")
+	fmt.Println()
+	fmt.Printf("Key: %s\n", hexKey)
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("------")
+	fmt.Println("Use this key on BOTH server and client:")
+	fmt.Println()
+	fmt.Printf("  Server: sudo go run simple-vpn.go -mode server -key %s ...\n", hexKey)
+	fmt.Printf("  Client: sudo go run simple-vpn.go -mode client -key %s ...\n", hexKey)
+	fmt.Println()
+	fmt.Println("Security Notes:")
+	fmt.Println("- Keep this key SECRET")
+	fmt.Println("- Share it securely with the other peer (SSH, secure channel)")
+	fmt.Println("- Both peers MUST use the SAME key")
+	fmt.Println("- Generate a new key periodically for better security")
+	fmt.Println("==============================================")
+}
+
+// parseEncryptionKey validates and decodes a hex-encoded encryption key
+func parseEncryptionKey(hexKey string) ([]byte, error) {
+	// Remove any whitespace
+	hexKey = strings.TrimSpace(hexKey)
+
+	// Check length (64 hex chars = 32 bytes)
+	if len(hexKey) != 64 {
+		return nil, fmt.Errorf("key must be exactly 64 hex characters (32 bytes), got %d characters", len(hexKey))
+	}
+
+	// Decode hex string to bytes
+	key, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return nil, fmt.Errorf("key must be a valid hexadecimal string: %w", err)
+	}
+
+	// Double-check length after decoding
+	if len(key) != 32 {
+		return nil, fmt.Errorf("decoded key must be 32 bytes, got %d bytes", len(key))
+	}
+
+	return key, nil
 }
 
 // =============================================================================
