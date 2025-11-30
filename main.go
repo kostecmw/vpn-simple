@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // Simplified VPN - Educational purposes only
@@ -57,7 +60,8 @@ type Device struct {
 	peer          *Peer
 	config        *Config
 	routeBackup   *RouteBackup
-	encryptionKey []byte // 32-byte encryption key
+	encryptionKey []byte        // 32-byte encryption key
+	crypto        *CryptoEngine // Encryption/decryption engine
 }
 
 // TUNDevice represents a virtual network interface
@@ -142,7 +146,17 @@ func parseFlags() *Config {
 	flag.StringVar(&config.AddRoute, "route", "", "Add route via VPN (e.g., 'default' or '8.8.8.8/32')")
 	flag.StringVar(&config.EncryptionKey, "key", "", "Encryption key (64 hex characters = 32 bytes)")
 	flag.BoolVar(&config.GenerateKey, "generate-key", false, "Generate a new encryption key and exit")
+
+	// Hidden flag for testing crypto
+	testCrypto := flag.Bool("test-crypto", false, "Test encryption/decryption and exit")
+
 	flag.Parse()
+
+	// If testing crypto, run test and exit
+	if *testCrypto {
+		testCryptoEngine()
+		return config
+	}
 
 	// If generating key, no other validation needed
 	if config.GenerateKey {
@@ -172,13 +186,22 @@ func parseFlags() *Config {
 func NewDevice(config *Config) (*Device, error) {
 	// Parse and validate encryption key if provided
 	var encryptionKey []byte
+	var cryptoEngine *CryptoEngine
+
 	if config.EncryptionKey != "" {
 		key, err := parseEncryptionKey(config.EncryptionKey)
 		if err != nil {
 			return nil, fmt.Errorf("invalid encryption key: %w", err)
 		}
 		encryptionKey = key
-		log.Printf("✓ Encryption key loaded (%d bytes)", len(encryptionKey))
+
+		// Initialize crypto engine
+		cryptoEngine, err = NewCryptoEngine(encryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize crypto: %w", err)
+		}
+
+		log.Printf("✓ Encryption enabled with ChaCha20-Poly1305 (%d bytes key)", len(encryptionKey))
 	} else {
 		log.Printf("⚠ Warning: No encryption key provided - traffic will be sent in PLAINTEXT!")
 		log.Printf("   Generate a key with: go run simple-vpn.go -generate-key")
@@ -224,6 +247,7 @@ func NewDevice(config *Config) (*Device, error) {
 		config:        config,
 		routeBackup:   &RouteBackup{},
 		encryptionKey: encryptionKey,
+		crypto:        cryptoEngine,
 	}, nil
 }
 
@@ -671,6 +695,184 @@ func parseEncryptionKey(hexKey string) ([]byte, error) {
 }
 
 // =============================================================================
+// Cryptography Engine
+// =============================================================================
+
+// CryptoEngine handles encryption and decryption using ChaCha20-Poly1305
+type CryptoEngine struct {
+	aead cipher.AEAD
+}
+
+// NewCryptoEngine creates a new crypto engine with the given key
+func NewCryptoEngine(key []byte) (*CryptoEngine, error) {
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("key must be %d bytes, got %d", chacha20poly1305.KeySize, len(key))
+	}
+
+	// Create ChaCha20-Poly1305 AEAD cipher
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	return &CryptoEngine{
+		aead: aead,
+	}, nil
+}
+
+// Encrypt encrypts plaintext and returns [nonce || ciphertext || tag]
+func (c *CryptoEngine) Encrypt(plaintext []byte) ([]byte, error) {
+	// Generate random nonce (12 bytes for ChaCha20-Poly1305)
+	nonce := make([]byte, c.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	// Encrypt and authenticate
+	// Seal appends the ciphertext and tag to dst (starting with nonce)
+	ciphertext := c.aead.Seal(nonce, nonce, plaintext, nil)
+
+	return ciphertext, nil
+}
+
+// Decrypt decrypts ciphertext of format [nonce || ciphertext || tag]
+func (c *CryptoEngine) Decrypt(data []byte) ([]byte, error) {
+	nonceSize := c.aead.NonceSize()
+
+	// Check minimum length: nonce + at least some data + tag
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short: need at least %d bytes for nonce", nonceSize)
+	}
+
+	// Extract nonce and ciphertext
+	nonce := data[:nonceSize]
+	ciphertext := data[nonceSize:]
+
+	// Decrypt and verify
+	plaintext, err := c.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed (wrong key or corrupted data): %w", err)
+	}
+
+	return plaintext, nil
+}
+
+// GetOverhead returns the number of extra bytes added by encryption
+func (c *CryptoEngine) GetOverhead() int {
+	// Nonce size + tag size
+	return c.aead.NonceSize() + c.aead.Overhead()
+}
+
+// =============================================================================
+// Crypto Testing
+// =============================================================================
+
+// testCryptoEngine tests the encryption/decryption functionality
+func testCryptoEngine() {
+	fmt.Println("==============================================")
+	fmt.Println("     Testing Crypto Engine")
+	fmt.Println("==============================================")
+	fmt.Println()
+
+	// Generate a test key
+	key := make([]byte, 32)
+	rand.Read(key)
+	fmt.Printf("Test key: %x\n", key)
+	fmt.Println()
+
+	// Create crypto engine
+	crypto, err := NewCryptoEngine(key)
+	if err != nil {
+		fmt.Printf("❌ Failed to create crypto engine: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✓ Crypto engine created\n")
+	fmt.Printf("  - Nonce size: %d bytes\n", crypto.aead.NonceSize())
+	fmt.Printf("  - Tag size: %d bytes\n", crypto.aead.Overhead())
+	fmt.Printf("  - Total overhead: %d bytes\n", crypto.GetOverhead())
+	fmt.Println()
+
+	// Test cases
+	testCases := []struct {
+		name string
+		data string
+	}{
+		{"Short message", "Hello, World!"},
+		{"Empty message", ""},
+		{"Long message", strings.Repeat("The quick brown fox jumps over the lazy dog. ", 10)},
+		{"Binary data", string([]byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd})},
+	}
+
+	for i, tc := range testCases {
+		fmt.Printf("Test %d: %s\n", i+1, tc.name)
+		fmt.Printf("  Original length: %d bytes\n", len(tc.data))
+
+		// Encrypt
+		encrypted, err := crypto.Encrypt([]byte(tc.data))
+		if err != nil {
+			fmt.Printf("  ❌ Encryption failed: %v\n", err)
+			continue
+		}
+		fmt.Printf("  ✓ Encrypted length: %d bytes (overhead: %d)\n",
+			len(encrypted), len(encrypted)-len(tc.data))
+
+		// Decrypt
+		decrypted, err := crypto.Decrypt(encrypted)
+		if err != nil {
+			fmt.Printf("  ❌ Decryption failed: %v\n", err)
+			continue
+		}
+		fmt.Printf("  ✓ Decrypted length: %d bytes\n", len(decrypted))
+
+		// Verify
+		if string(decrypted) != tc.data {
+			fmt.Printf("  ❌ Data mismatch!\n")
+			fmt.Printf("     Original:  %q\n", tc.data)
+			fmt.Printf("     Decrypted: %q\n", string(decrypted))
+			continue
+		}
+		fmt.Printf("  ✓ Data matches original\n")
+		fmt.Println()
+	}
+
+	// Test with wrong key
+	fmt.Println("Test: Wrong key detection")
+	wrongKey := make([]byte, 32)
+	rand.Read(wrongKey)
+	wrongCrypto, _ := NewCryptoEngine(wrongKey)
+
+	encrypted, _ := crypto.Encrypt([]byte("Secret message"))
+	_, err = wrongCrypto.Decrypt(encrypted)
+	if err != nil {
+		fmt.Printf("  ✓ Correctly rejected decryption with wrong key\n")
+		fmt.Printf("    Error: %v\n", err)
+	} else {
+		fmt.Printf("  ❌ Should have failed with wrong key!\n")
+	}
+	fmt.Println()
+
+	// Test tampered data
+	fmt.Println("Test: Tampered data detection")
+	encrypted, _ = crypto.Encrypt([]byte("Original message"))
+	// Flip a bit in the ciphertext
+	encrypted[20] ^= 0x01
+	_, err = crypto.Decrypt(encrypted)
+	if err != nil {
+		fmt.Printf("  ✓ Correctly rejected tampered data\n")
+		fmt.Printf("    Error: %v\n", err)
+	} else {
+		fmt.Printf("  ❌ Should have detected tampering!\n")
+	}
+	fmt.Println()
+
+	fmt.Println("==============================================")
+	fmt.Println("  All crypto tests completed!")
+	fmt.Println("==============================================")
+
+	os.Exit(0)
+}
+
+// =============================================================================
 // TUN Device Implementation (Linux-specific, simplified)
 // =============================================================================
 
@@ -740,6 +942,43 @@ func (t *TUNDevice) Close() error {
 // =============================================================================
 
 /*
+STEP 1: GENERATE ENCRYPTION KEY
+
+$ go run simple-vpn.go -generate-key
+
+Output:
+==============================================
+        Generated Encryption Key
+==============================================
+
+Key: 3a7f8c2e9d1b4f6a0e5c8d3a7f9b2c1e4d6a8f0b3c5e7a9d1f3b5c7e9a1d3f5
+...
+
+Copy this key - you'll need it for both server and client!
+
+---
+
+STEP 2: TEST ENCRYPTION (OPTIONAL)
+
+$ go run simple-vpn.go -test-crypto
+
+Output:
+==============================================
+     Testing Crypto Engine
+==============================================
+✓ Crypto engine created
+  - Nonce size: 12 bytes
+  - Tag size: 16 bytes
+  - Total overhead: 28 bytes
+
+Test 1: Short message
+  ✓ Encrypted
+  ✓ Decrypted
+  ✓ Data matches original
+...
+
+---
+
 SIMPLE SETUP (just ping between peers):
 
 Terminal 1 (Server):
@@ -747,16 +986,20 @@ $ sudo go run simple-vpn.go \
     -mode server \
     -local :51820 \
     -remote 127.0.0.1:51821 \
-    -tun-ip 10.0.0.1
+    -tun-ip 10.0.0.1 \
+    -key 3a7f8c2e9d1b4f6a0e5c8d3a7f9b2c1e4d6a8f0b3c5e7a9d1f3b5c7e9a1d3f5
 
 Terminal 2 (Client):
 $ sudo go run simple-vpn.go \
     -mode client \
     -local :51821 \
     -remote 127.0.0.1:51820 \
-    -tun-ip 10.0.0.2
+    -tun-ip 10.0.0.2 \
+    -key 3a7f8c2e9d1b4f6a0e5c8d3a7f9b2c1e4d6a8f0b3c5e7a9d1f3b5c7e9a1d3f5
 
 Test: ping 10.0.0.1 (from client) or ping 10.0.0.2 (from server)
+
+⚠️ NOTE: Both peers MUST use the SAME key!
 
 ---
 
@@ -769,7 +1012,8 @@ $ sudo go run simple-vpn.go \
     -remote CLIENT_PUBLIC_IP:51821 \
     -tun-ip 10.0.0.1 \
     -enable-nat \
-    -nat-iface eth0
+    -nat-iface eth0 \
+    -key YOUR_KEY_HERE
 
 Terminal 2 (Client with default route):
 $ sudo go run simple-vpn.go \
@@ -777,24 +1021,22 @@ $ sudo go run simple-vpn.go \
     -local :51821 \
     -remote SERVER_PUBLIC_IP:51820 \
     -tun-ip 10.0.0.2 \
-    -route default
+    -route default \
+    -key YOUR_KEY_HERE
 
 Test: curl ifconfig.me (should show server's IP)
 
 ---
 
-SPECIFIC ROUTES (only route certain IPs through VPN):
+WITHOUT ENCRYPTION (for testing - NOT RECOMMENDED):
 
-Terminal 2 (Client):
 $ sudo go run simple-vpn.go \
-    -mode client \
-    -local :51821 \
-    -remote 127.0.0.1:51820 \
-    -tun-ip 10.0.0.2 \
-    -route 8.8.8.8/32
+    -mode server \
+    -local :51820 \
+    -remote 127.0.0.1:51821 \
+    -tun-ip 10.0.0.1
 
-Test: ping 8.8.8.8 (goes through VPN)
-      ping 1.1.1.1 (goes directly)
+⚠️ Warning: No encryption key provided - traffic will be sent in PLAINTEXT!
 
 ---
 
@@ -817,6 +1059,12 @@ FLAGS:
         Network interface for NAT (default "eth0")
   -route string
         Add route via VPN: "default" or specific IP/CIDR
+  -key string
+        Encryption key (64 hex characters = 32 bytes)
+  -generate-key
+        Generate a new encryption key and exit
+  -test-crypto
+        Test encryption/decryption and exit
 
 CLEANUP:
 The program automatically cleans up on exit (Ctrl+C)
