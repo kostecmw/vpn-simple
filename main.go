@@ -34,6 +34,13 @@ type Config struct {
 	AddRoute   string // Add route via VPN (e.g., "default" or "8.8.8.8/32")
 }
 
+// RouteBackup stores original routing information for restoration
+type RouteBackup struct {
+	defaultGateway  string
+	defaultIface    string
+	hadDefaultRoute bool
+}
+
 // Peer represents the other end of the VPN tunnel
 type Peer struct {
 	addr *net.UDPAddr
@@ -42,9 +49,10 @@ type Peer struct {
 
 // Device represents our VPN device
 type Device struct {
-	tun    *TUNDevice
-	peer   *Peer
-	config *Config
+	tun         *TUNDevice
+	peer        *Peer
+	config      *Config
+	routeBackup *RouteBackup
 }
 
 // TUNDevice represents a virtual network interface
@@ -179,9 +187,10 @@ func NewDevice(config *Config) (*Device, error) {
 	log.Printf("✓ UDP socket listening on: %s", localAddr.String())
 
 	return &Device{
-		tun:    tun,
-		peer:   peer,
-		config: config,
+		tun:         tun,
+		peer:        peer,
+		config:      config,
+		routeBackup: &RouteBackup{},
 	}, nil
 }
 
@@ -222,7 +231,11 @@ func (d *Device) SetupRouting() error {
 	route := d.config.AddRoute
 
 	if route == "default" {
-		// Add default route through VPN
+		// Save original default route
+		if err := d.backupDefaultRoute(); err != nil {
+			log.Printf("Warning: Could not backup default route: %v", err)
+		}
+
 		// Extract gateway IP from TUN IP (assuming peer is x.x.x.1 if we're x.x.x.2)
 		parts := strings.Split(d.config.TunIP, ".")
 		if len(parts) != 4 {
@@ -238,11 +251,32 @@ func (d *Device) SetupRouting() error {
 			gateway += ".1"
 		}
 
-		// Add default route with higher metric (so it doesn't override existing)
-		if err := runCommand("ip", "route", "add", "default", "via", gateway, "dev", d.tun.name, "metric", "100"); err != nil {
+		// Add route for VPN server through original gateway (prevent routing loop)
+		serverIP := extractIPFromAddr(d.config.RemoteAddr)
+		if serverIP != "" && serverIP != "127.0.0.1" && d.routeBackup.hadDefaultRoute {
+			if err := runCommand("ip", "route", "add", serverIP, "via", d.routeBackup.defaultGateway, "dev", d.routeBackup.defaultIface); err != nil {
+				log.Printf("Warning: Could not add server route: %v", err)
+			} else {
+				log.Printf("✓ Route to VPN server (%s) via original gateway", serverIP)
+			}
+		}
+
+		// Delete old default route
+		if d.routeBackup.hadDefaultRoute {
+			if err := runCommand("ip", "route", "del", "default"); err != nil {
+				log.Printf("Warning: Could not delete old default route: %v", err)
+			} else {
+				log.Printf("✓ Removed old default route")
+			}
+		}
+
+		// Add new default route through VPN
+		if err := runCommand("ip", "route", "add", "default", "via", gateway, "dev", d.tun.name); err != nil {
+			// Try to restore if this fails
+			d.restoreDefaultRoute()
 			return fmt.Errorf("add default route: %w", err)
 		}
-		log.Printf("✓ Default route via %s", gateway)
+		log.Printf("✓ New default route via %s", gateway)
 
 	} else {
 		// Add specific route
@@ -318,7 +352,17 @@ func (d *Device) Cleanup() {
 	// Remove routes
 	if d.config.AddRoute != "" {
 		if d.config.AddRoute == "default" {
+			// Remove VPN default route
 			runCommand("ip", "route", "del", "default", "dev", d.tun.name)
+
+			// Remove server-specific route
+			serverIP := extractIPFromAddr(d.config.RemoteAddr)
+			if serverIP != "" && serverIP != "127.0.0.1" {
+				runCommand("ip", "route", "del", serverIP)
+			}
+
+			// Restore original default route
+			d.restoreDefaultRoute()
 		} else {
 			runCommand("ip", "route", "del", d.config.AddRoute, "dev", d.tun.name)
 		}
@@ -459,6 +503,80 @@ func getNetworkAddress(ip, mask string) string {
 		return ip
 	}
 	return fmt.Sprintf("%s.%s.%s.0", parts[0], parts[1], parts[2])
+}
+
+// backupDefaultRoute saves the current default route
+func (d *Device) backupDefaultRoute() error {
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("get default route: %w", err)
+	}
+
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		log.Printf("No default route found to backup")
+		d.routeBackup.hadDefaultRoute = false
+		return nil
+	}
+
+	// Parse: "default via 192.168.1.1 dev eth0"
+	parts := strings.Fields(line)
+	for i, part := range parts {
+		if part == "via" && i+1 < len(parts) {
+			d.routeBackup.defaultGateway = parts[i+1]
+		}
+		if part == "dev" && i+1 < len(parts) {
+			d.routeBackup.defaultIface = parts[i+1]
+		}
+	}
+
+	if d.routeBackup.defaultGateway != "" && d.routeBackup.defaultIface != "" {
+		d.routeBackup.hadDefaultRoute = true
+		log.Printf("✓ Backed up default route: via %s dev %s",
+			d.routeBackup.defaultGateway, d.routeBackup.defaultIface)
+		return nil
+	}
+
+	return fmt.Errorf("could not parse default route")
+}
+
+// restoreDefaultRoute restores the original default route
+func (d *Device) restoreDefaultRoute() {
+	if !d.routeBackup.hadDefaultRoute {
+		return
+	}
+
+	if err := runCommand("ip", "route", "add", "default",
+		"via", d.routeBackup.defaultGateway,
+		"dev", d.routeBackup.defaultIface); err != nil {
+		log.Printf("Warning: Could not restore default route: %v", err)
+	} else {
+		log.Printf("✓ Restored default route: via %s dev %s",
+			d.routeBackup.defaultGateway, d.routeBackup.defaultIface)
+	}
+}
+
+// extractIPFromAddr extracts IP from "host:port" string
+func extractIPFromAddr(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+
+	// If it's a hostname, resolve it
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return host
+	}
+
+	// Try to resolve hostname
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return ""
+	}
+
+	return ips[0].String()
 }
 
 // =============================================================================
