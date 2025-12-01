@@ -4,7 +4,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"wg-go/wg-simple/crypto"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -60,8 +61,8 @@ type Device struct {
 	peer          *Peer
 	config        *Config
 	routeBackup   *RouteBackup
-	encryptionKey []byte        // 32-byte encryption key
-	crypto        *CryptoEngine // Encryption/decryption engine
+	encryptionKey []byte         // 32-byte encryption key
+	crypto        *crypto.Engine // Encryption/decryption engine
 }
 
 // TUNDevice represents a virtual network interface
@@ -186,17 +187,17 @@ func parseFlags() *Config {
 func NewDevice(config *Config) (*Device, error) {
 	// Parse and validate encryption key if provided
 	var encryptionKey []byte
-	var cryptoEngine *CryptoEngine
+	var cryptoEngine *crypto.Engine
 
 	if config.EncryptionKey != "" {
-		key, err := parseEncryptionKey(config.EncryptionKey)
+		key, err := crypto.ParseKey(config.EncryptionKey)
 		if err != nil {
 			return nil, fmt.Errorf("invalid encryption key: %w", err)
 		}
 		encryptionKey = key
 
 		// Initialize crypto engine
-		cryptoEngine, err = NewCryptoEngine(encryptionKey)
+		cryptoEngine, err = crypto.NewEngine(encryptionKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize crypto: %w", err)
 		}
@@ -642,12 +643,12 @@ func extractIPFromAddr(addr string) string {
 
 // generateAndPrintKey generates a new random 32-byte encryption key
 func generateAndPrintKey() {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
+	key, err := crypto.GenerateKey()
+	if err != nil {
 		log.Fatalf("Failed to generate random key: %v", err)
 	}
 
-	hexKey := hex.EncodeToString(key)
+	hexKey := crypto.KeyToHex(key)
 
 	fmt.Println("==============================================")
 	fmt.Println("        Generated Encryption Key")
@@ -668,30 +669,6 @@ func generateAndPrintKey() {
 	fmt.Println("- Both peers MUST use the SAME key")
 	fmt.Println("- Generate a new key periodically for better security")
 	fmt.Println("==============================================")
-}
-
-// parseEncryptionKey validates and decodes a hex-encoded encryption key
-func parseEncryptionKey(hexKey string) ([]byte, error) {
-	// Remove any whitespace
-	hexKey = strings.TrimSpace(hexKey)
-
-	// Check length (64 hex chars = 32 bytes)
-	if len(hexKey) != 64 {
-		return nil, fmt.Errorf("key must be exactly 64 hex characters (32 bytes), got %d characters", len(hexKey))
-	}
-
-	// Decode hex string to bytes
-	key, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return nil, fmt.Errorf("key must be a valid hexadecimal string: %w", err)
-	}
-
-	// Double-check length after decoding
-	if len(key) != 32 {
-		return nil, fmt.Errorf("decoded key must be 32 bytes, got %d bytes", len(key))
-	}
-
-	return key, nil
 }
 
 // =============================================================================
@@ -775,21 +752,24 @@ func testCryptoEngine() {
 	fmt.Println()
 
 	// Generate a test key
-	key := make([]byte, 32)
-	rand.Read(key)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		fmt.Printf("❌ Failed to generate key: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("Test key: %x\n", key)
 	fmt.Println()
 
 	// Create crypto engine
-	crypto, err := NewCryptoEngine(key)
+	engine, err := crypto.NewEngine(key)
 	if err != nil {
 		fmt.Printf("❌ Failed to create crypto engine: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("✓ Crypto engine created\n")
-	fmt.Printf("  - Nonce size: %d bytes\n", crypto.aead.NonceSize())
-	fmt.Printf("  - Tag size: %d bytes\n", crypto.aead.Overhead())
-	fmt.Printf("  - Total overhead: %d bytes\n", crypto.GetOverhead())
+	fmt.Printf("  - Nonce size: %d bytes\n", engine.NonceSize())
+	fmt.Printf("  - Tag size: %d bytes\n", engine.TagSize())
+	fmt.Printf("  - Total overhead: %d bytes\n", engine.Overhead())
 	fmt.Println()
 
 	// Test cases
@@ -808,7 +788,7 @@ func testCryptoEngine() {
 		fmt.Printf("  Original length: %d bytes\n", len(tc.data))
 
 		// Encrypt
-		encrypted, err := crypto.Encrypt([]byte(tc.data))
+		encrypted, err := engine.Encrypt([]byte(tc.data))
 		if err != nil {
 			fmt.Printf("  ❌ Encryption failed: %v\n", err)
 			continue
@@ -817,7 +797,7 @@ func testCryptoEngine() {
 			len(encrypted), len(encrypted)-len(tc.data))
 
 		// Decrypt
-		decrypted, err := crypto.Decrypt(encrypted)
+		decrypted, err := engine.Decrypt(encrypted)
 		if err != nil {
 			fmt.Printf("  ❌ Decryption failed: %v\n", err)
 			continue
@@ -837,12 +817,11 @@ func testCryptoEngine() {
 
 	// Test with wrong key
 	fmt.Println("Test: Wrong key detection")
-	wrongKey := make([]byte, 32)
-	rand.Read(wrongKey)
-	wrongCrypto, _ := NewCryptoEngine(wrongKey)
+	wrongKey, _ := crypto.GenerateKey()
+	wrongEngine, _ := crypto.NewEngine(wrongKey)
 
-	encrypted, _ := crypto.Encrypt([]byte("Secret message"))
-	_, err = wrongCrypto.Decrypt(encrypted)
+	encrypted, _ := engine.Encrypt([]byte("Secret message"))
+	_, err = wrongEngine.Decrypt(encrypted)
 	if err != nil {
 		fmt.Printf("  ✓ Correctly rejected decryption with wrong key\n")
 		fmt.Printf("    Error: %v\n", err)
@@ -853,10 +832,10 @@ func testCryptoEngine() {
 
 	// Test tampered data
 	fmt.Println("Test: Tampered data detection")
-	encrypted, _ = crypto.Encrypt([]byte("Original message"))
+	encrypted, _ = engine.Encrypt([]byte("Original message"))
 	// Flip a bit in the ciphertext
 	encrypted[20] ^= 0x01
-	_, err = crypto.Decrypt(encrypted)
+	_, err = engine.Decrypt(encrypted)
 	if err != nil {
 		fmt.Printf("  ✓ Correctly rejected tampered data\n")
 		fmt.Printf("    Error: %v\n", err)
