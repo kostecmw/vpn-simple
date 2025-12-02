@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -13,11 +11,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"wg-go/wg-simple/crypto"
-
-	"golang.org/x/crypto/chacha20poly1305"
+	"wg-go/wg-simple/tun"
 )
 
 // Simplified VPN - Educational purposes only
@@ -57,19 +53,12 @@ type Peer struct {
 
 // Device represents our VPN device
 type Device struct {
-	tun           *TUNDevice
+	tun           tun.Device
 	peer          *Peer
 	config        *Config
 	routeBackup   *RouteBackup
 	encryptionKey []byte         // 32-byte encryption key
 	crypto        *crypto.Engine // Encryption/decryption engine
-}
-
-// TUNDevice represents a virtual network interface
-type TUNDevice struct {
-	name string
-	fd   int
-	mtu  int
 }
 
 // Packet header: [Type:1 byte][Length:2 bytes][Data]
@@ -209,7 +198,11 @@ func NewDevice(config *Config) (*Device, error) {
 	}
 
 	// Create TUN device
-	tun, err := CreateTUN(config.TunName, MTU)
+	tund, err := tun.NewDevice(tun.Config{
+		Name: config.TunName,
+		MTU:  MTU,
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("create TUN: %w", err)
 	}
@@ -217,20 +210,20 @@ func NewDevice(config *Config) (*Device, error) {
 	// Setup UDP connection
 	localAddr, err := net.ResolveUDPAddr("udp", config.LocalAddr)
 	if err != nil {
-		tun.Close()
+		tund.Close()
 		return nil, fmt.Errorf("resolve local addr: %w", err)
 	}
 
 	conn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
-		tun.Close()
+		tund.Close()
 		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
 
 	remoteAddr, err := net.ResolveUDPAddr("udp", config.RemoteAddr)
 	if err != nil {
 		conn.Close()
-		tun.Close()
+		tund.Close()
 		return nil, fmt.Errorf("resolve remote addr: %w", err)
 	}
 
@@ -239,11 +232,11 @@ func NewDevice(config *Config) (*Device, error) {
 		conn: conn,
 	}
 
-	log.Printf("✓ TUN device created: %s (MTU: %d)", tun.name, MTU)
+	log.Printf("✓ TUN device created: %s (MTU: %d)", tund.Name(), tund.MTU())
 	log.Printf("✓ UDP socket listening on: %s", localAddr.String())
 
 	return &Device{
-		tun:           tun,
+		tun:           tund,
 		peer:          peer,
 		config:        config,
 		routeBackup:   &RouteBackup{},
@@ -254,23 +247,23 @@ func NewDevice(config *Config) (*Device, error) {
 
 // ConfigureTUN sets up the TUN interface with IP address
 func (d *Device) ConfigureTUN() error {
-	log.Printf("Configuring TUN interface %s...", d.tun.name)
+	log.Printf("Configuring TUN interface %s...", d.tun.Name())
 
 	// Set IP address
 	cidr := fmt.Sprintf("%s/%s", d.config.TunIP, d.config.TunMask)
-	if err := runCommand("ip", "addr", "add", cidr, "dev", d.tun.name); err != nil {
+	if err := runCommand("ip", "addr", "add", cidr, "dev", d.tun.Name()); err != nil {
 		return fmt.Errorf("set IP address: %w", err)
 	}
 	log.Printf("✓ IP address: %s", cidr)
 
 	// Set MTU
-	if err := runCommand("ip", "link", "set", d.tun.name, "mtu", fmt.Sprintf("%d", MTU)); err != nil {
+	if err := runCommand("ip", "link", "set", d.tun.Name(), "mtu", fmt.Sprintf("%d", d.tun.MTU())); err != nil {
 		return fmt.Errorf("set MTU: %w", err)
 	}
-	log.Printf("✓ MTU: %d", MTU)
+	log.Printf("✓ MTU: %d", d.tun.MTU())
 
 	// Bring interface up
-	if err := runCommand("ip", "link", "set", d.tun.name, "up"); err != nil {
+	if err := runCommand("ip", "link", "set", d.tun.Name(), "up"); err != nil {
 		return fmt.Errorf("bring interface up: %w", err)
 	}
 	log.Printf("✓ Interface is UP")
@@ -329,7 +322,7 @@ func (d *Device) SetupRouting() error {
 		}
 
 		// Add new default route through VPN
-		if err := runCommand("ip", "route", "add", "default", "via", gateway, "dev", d.tun.name); err != nil {
+		if err := runCommand("ip", "route", "add", "default", "via", gateway, "dev", d.tun.Name()); err != nil {
 			// Try to restore if this fails
 			d.restoreDefaultRoute()
 			return fmt.Errorf("add default route: %w", err)
@@ -347,7 +340,7 @@ func (d *Device) SetupRouting() error {
 			gateway += ".1"
 		}
 
-		if err := runCommand("ip", "route", "add", route, "via", gateway, "dev", d.tun.name); err != nil {
+		if err := runCommand("ip", "route", "add", route, "via", gateway, "dev", d.tun.Name()); err != nil {
 			return fmt.Errorf("add route: %w", err)
 		}
 		log.Printf("✓ Route %s via %s", route, gateway)
@@ -378,14 +371,14 @@ func (d *Device) SetupNAT() error {
 
 	// Allow forwarding from TUN to NAT interface
 	if err := runCommand("iptables", "-A", "FORWARD",
-		"-i", d.tun.name, "-o", d.config.NATIface, "-j", "ACCEPT"); err != nil {
+		"-i", d.tun.Name(), "-o", d.config.NATIface, "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("add forward rule: %w", err)
 	}
 	log.Printf("✓ Forward rule added")
 
 	// Allow forwarding from NAT interface to TUN (established connections)
 	if err := runCommand("iptables", "-A", "FORWARD",
-		"-i", d.config.NATIface, "-o", d.tun.name,
+		"-i", d.config.NATIface, "-o", d.tun.Name(),
 		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("add return forward rule: %w", err)
 	}
@@ -411,7 +404,7 @@ func (d *Device) Cleanup() {
 	if d.config.AddRoute != "" {
 		if d.config.AddRoute == "default" {
 			// Remove VPN default route
-			runCommand("ip", "route", "del", "default", "dev", d.tun.name)
+			runCommand("ip", "route", "del", "default", "dev", d.tun.Name())
 
 			// Remove server-specific route
 			serverIP := extractIPFromAddr(d.config.RemoteAddr)
@@ -422,7 +415,7 @@ func (d *Device) Cleanup() {
 			// Restore original default route
 			d.restoreDefaultRoute()
 		} else {
-			runCommand("ip", "route", "del", d.config.AddRoute, "dev", d.tun.name)
+			runCommand("ip", "route", "del", d.config.AddRoute, "dev", d.tun.Name())
 		}
 	}
 
@@ -432,9 +425,9 @@ func (d *Device) Cleanup() {
 		runCommand("iptables", "-t", "nat", "-D", "POSTROUTING",
 			"-s", subnet, "-o", d.config.NATIface, "-j", "MASQUERADE")
 		runCommand("iptables", "-D", "FORWARD",
-			"-i", d.tun.name, "-o", d.config.NATIface, "-j", "ACCEPT")
+			"-i", d.tun.Name(), "-o", d.config.NATIface, "-j", "ACCEPT")
 		runCommand("iptables", "-D", "FORWARD",
-			"-i", d.config.NATIface, "-o", d.tun.name,
+			"-i", d.config.NATIface, "-o", d.tun.Name(),
 			"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 		runCommand("iptables", "-t", "mangle", "-D", "FORWARD",
 			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
@@ -672,75 +665,6 @@ func generateAndPrintKey() {
 }
 
 // =============================================================================
-// Cryptography Engine
-// =============================================================================
-
-// CryptoEngine handles encryption and decryption using ChaCha20-Poly1305
-type CryptoEngine struct {
-	aead cipher.AEAD
-}
-
-// NewCryptoEngine creates a new crypto engine with the given key
-func NewCryptoEngine(key []byte) (*CryptoEngine, error) {
-	if len(key) != chacha20poly1305.KeySize {
-		return nil, fmt.Errorf("key must be %d bytes, got %d", chacha20poly1305.KeySize, len(key))
-	}
-
-	// Create ChaCha20-Poly1305 AEAD cipher
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-
-	return &CryptoEngine{
-		aead: aead,
-	}, nil
-}
-
-// Encrypt encrypts plaintext and returns [nonce || ciphertext || tag]
-func (c *CryptoEngine) Encrypt(plaintext []byte) ([]byte, error) {
-	// Generate random nonce (12 bytes for ChaCha20-Poly1305)
-	nonce := make([]byte, c.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	// Encrypt and authenticate
-	// Seal appends the ciphertext and tag to dst (starting with nonce)
-	ciphertext := c.aead.Seal(nonce, nonce, plaintext, nil)
-
-	return ciphertext, nil
-}
-
-// Decrypt decrypts ciphertext of format [nonce || ciphertext || tag]
-func (c *CryptoEngine) Decrypt(data []byte) ([]byte, error) {
-	nonceSize := c.aead.NonceSize()
-
-	// Check minimum length: nonce + at least some data + tag
-	if len(data) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short: need at least %d bytes for nonce", nonceSize)
-	}
-
-	// Extract nonce and ciphertext
-	nonce := data[:nonceSize]
-	ciphertext := data[nonceSize:]
-
-	// Decrypt and verify
-	plaintext, err := c.aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("decryption failed (wrong key or corrupted data): %w", err)
-	}
-
-	return plaintext, nil
-}
-
-// GetOverhead returns the number of extra bytes added by encryption
-func (c *CryptoEngine) GetOverhead() int {
-	// Nonce size + tag size
-	return c.aead.NonceSize() + c.aead.Overhead()
-}
-
-// =============================================================================
 // Crypto Testing
 // =============================================================================
 
@@ -849,71 +773,6 @@ func testCryptoEngine() {
 	fmt.Println("==============================================")
 
 	os.Exit(0)
-}
-
-// =============================================================================
-// TUN Device Implementation (Linux-specific, simplified)
-// =============================================================================
-
-func CreateTUN(name string, mtu int) (*TUNDevice, error) {
-	// Open TUN device
-	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
-	}
-
-	// Setup IFR request structure
-	var ifr struct {
-		name  [16]byte
-		flags uint16
-		_     [22]byte // padding
-	}
-
-	copy(ifr.name[:], name)
-	ifr.flags = 0x0001 // IFF_TUN
-
-	// Create TUN interface
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(0x400454ca), // TUNSETIFF
-		uintptr(unsafe.Pointer(&ifr)),
-	)
-	if errno != 0 {
-		syscall.Close(fd)
-		return nil, fmt.Errorf("ioctl TUNSETIFF: %v", errno)
-	}
-
-	// Get actual interface name
-	actualName := string(ifr.name[:])
-	for i, c := range actualName {
-		if c == 0 {
-			actualName = actualName[:i]
-			break
-		}
-	}
-
-	tun := &TUNDevice{
-		name: actualName,
-		fd:   fd,
-		mtu:  mtu,
-	}
-
-	return tun, nil
-}
-
-func (t *TUNDevice) Read(buf []byte) (int, error) {
-	n, err := syscall.Read(t.fd, buf)
-	return n, err
-}
-
-func (t *TUNDevice) Write(buf []byte) (int, error) {
-	n, err := syscall.Write(t.fd, buf)
-	return n, err
-}
-
-func (t *TUNDevice) Close() error {
-	return syscall.Close(t.fd)
 }
 
 // =============================================================================
